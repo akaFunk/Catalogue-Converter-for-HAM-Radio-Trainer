@@ -1,0 +1,14 @@
+.venv/
+.idea/
+uv.lock
+
+.50ohm_cache/
+50ohm_links.json
+50ohm_links.missing.txt
+
+.bnetza_latex_cache/
+.image-diagnosis/
+
+*.etq
+*.catalog.xml
+*.appendix.xml

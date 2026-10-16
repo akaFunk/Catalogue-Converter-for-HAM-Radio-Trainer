@@ -1,0 +1,10 @@
+[project]
+name = "catalogue-converter-for-ham-radio-trainer"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "cairosvg>=2.9.1",
+    "pymupdf>=1.28.2",
+    "requests>=2.34.2",
+]
