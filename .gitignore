@@ -1,5 +1,6 @@
 .venv/
 .idea/
+__pycache__/
 uv.lock
 
 .50ohm_cache/
