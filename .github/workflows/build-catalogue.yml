@@ -1,0 +1,203 @@
+name: Build amateur radio catalogue
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish a new catalogue release (default branch only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalogue-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      UV_LOCKED: 'true'
+      PYTHONUTF8: '1'
+      BNETZA_URL: 'https://www.bundesnetzagentur.de/SharedDocs/Downloads/DE/Sachgebiete/Telekommunikation/Unternehmen_Institutionen/Frequenzen/Amateurfunk/Fragenkatalog/PruefungsfragenZIP.zip?__blob=publicationFile'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies from lockfile
+        run: uv sync --locked
+
+      - name: Install Cairo and TeX Live
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libcairo2 \
+            texlive-luatex \
+            texlive-latex-recommended \
+            texlive-latex-extra \
+            texlive-fonts-recommended \
+            fonts-lmodern \
+            fonts-texgyre
+
+      - name: Restore formula cache
+        uses: actions/cache@v4
+        with:
+          path: .bnetza_latex_cache
+          key: formula-v1-${{ runner.os }}-${{ hashFiles('uv.lock', 'bnetza_latex.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            formula-v1-${{ runner.os }}-${{ hashFiles('uv.lock', 'bnetza_latex.py') }}-
+
+      - name: Check rendering dependencies
+        run: |
+          uv run python -c "import cairosvg, pymupdf; print('CairoSVG and PyMuPDF import OK')"
+          lualatex --version
+          for package in standalone.cls amsmath.sty fontspec.sty unicode-math.sty; do
+            kpsewhich "$package"
+          done
+
+      - name: Download current BNetzA catalogue
+        run: |
+          curl --fail --location --show-error \
+            --retry 4 --retry-delay 5 \
+            --connect-timeout 30 --max-time 300 \
+            --output PruefungsfragenZIP.zip \
+            "$BNETZA_URL"
+          uv run python -m zipfile --test PruefungsfragenZIP.zip
+
+      - name: Generate current 50ohm references
+        run: uv run build_50ohm_links.py --catalog-zip PruefungsfragenZIP.zip
+
+      - name: Convert catalogue
+        run: uv run bnetza_to_etq.py PruefungsfragenZIP.zip de.amateurfunk.2024.etq
+
+      - name: Stage output and provenance
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          test -s de.amateurfunk.2024.etq
+          mkdir -p dist
+          cp de.amateurfunk.2024.etq dist/
+          cp 50ohm_links.json dist/
+          cp uv.lock dist/
+          uv run python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          with zipfile.ZipFile('PruefungsfragenZIP.zip') as archive:
+              metadata = []
+              for name in archive.namelist():
+                  if name.lower().endswith('.json'):
+                      data = json.loads(archive.read(name).decode('utf-8-sig'))
+                      if isinstance(data, dict) and 'sections' in data:
+                          metadata.append({'file': name, 'metadata': data.get('metadata', {})})
+          manifest = {
+              'built_at': datetime.now(timezone.utc).isoformat(),
+              'commit': os.environ['BUILD_COMMIT'],
+              'run_url': os.environ['BUILD_RUN_URL'],
+              'source_url': os.environ['BNETZA_URL'],
+              'source_sha256': hashlib.sha256(Path('PruefungsfragenZIP.zip').read_bytes()).hexdigest(),
+              'catalogues': metadata,
+          }
+          Path('dist/build-info.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+          )
+          PY
+          (cd dist && sha256sum *.etq > SHA256SUMS)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amateurfunk-katalog
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalogue-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            .bnetza_latex_cache/*.error.log
+            .bnetza_latex_cache/*.error.tex
+            50ohm_links.json
+            50ohm_links.missing.txt
+
+  release:
+    needs: build
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: amateurfunk-katalog
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [[ "$EVENT_NAME" == 'push' && "$REF_TYPE" == 'tag' ]]; then
+            tag="$REF_NAME"
+          else
+            tag="catalogue-$(date -u +%Y%m%d)-${RUN_ID}"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to overwrite assets."
+            exit 1
+          fi
+
+          cat > release-notes.md <<'EOF'
+          Automatisch erzeugter HamRadioTrainer-Katalog.
+
+          Assets:
+          - .etq: importierbarer Fragenkatalog
+          - SHA256SUMS: Prüfsumme des Katalogs
+          - build-info.json: Quellenstand, Quellprüfsumme und Build-Commit
+          - 50ohm_links.json: verwendeter Kurslinkindex
+          - uv.lock: verwendeter Python-Dependency-Lockstand
+
+          Prüfungsfragen: Bundesnetzagentur. Erklärungslinks: 50ohm.de / DARC.
+          Dies ist ein konvertierter Katalog, keine amtliche Prüfungssoftware.
+          EOF
+
+          gh release create "$tag" dist/* \
+            --target "$COMMIT" \
+            --title "Amateurfunk-Fragenkatalog $tag" \
+            --notes-file release-notes.md
